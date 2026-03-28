@@ -1,196 +1,102 @@
 from __future__ import annotations
 
-import numpy as np
+from dataclasses import dataclass
+from enum import Enum
+import random
 
 
-def set_seed(seed: int = 0) -> None:
-    np.random.seed(seed)
+class Tier(str, Enum):
+    HOT = "hot"
+    WARM = "warm"
+    COLD = "cold"
 
 
-def mse(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.mean((a - b) ** 2))
+@dataclass
+class KVBlock:
+    block_id: str
+    active: bool
+    reuse_score: float
+    size_mb: float
+    tier: Tier | None = None
+    codec: str | None = None
 
 
-# -----------------------------
-# TurboQuant-like toy codec
-# -----------------------------
-class TurboQuantToy:
-    """
-    Educational toy approximation:
-    1) random orthogonal rotation
-    2) uniform quantization to low bit-width
-    3) 1-bit residual sign correction
-
-    This is NOT the real TurboQuant algorithm.
-    It only captures the broad systems intuition.
-    """
-
-    def __init__(self, dim: int, bits: int = 3):
-        self.dim = dim
-        self.bits = bits
-        self.R = self._random_orthogonal(dim)
-
-    @staticmethod
-    def _random_orthogonal(dim: int) -> np.ndarray:
-        q, _ = np.linalg.qr(np.random.randn(dim, dim))
-        return q
-
-    def compress(self, x: np.ndarray) -> dict:
-        y = x @ self.R
-        max_abs = np.max(np.abs(y), axis=1, keepdims=True) + 1e-8
-
-        levels = 2 ** self.bits
-        qmax = levels // 2 - 1
-        q = np.round(np.clip(y / max_abs, -1.0, 1.0) * qmax).astype(np.int16)
-
-        y_hat = q.astype(np.float32) / qmax * max_abs
-        residual = y - y_hat
-        residual_sign = (residual >= 0).astype(np.uint8)
-
-        return {
-            "q": q,
-            "scale": max_abs,
-            "residual_sign": residual_sign,
-        }
-
-    def decompress(self, packed: dict) -> np.ndarray:
-        q = packed["q"]
-        max_abs = packed["scale"]
-        residual_sign = packed["residual_sign"]
-
-        qmax = 2 ** self.bits // 2 - 1
-        y_hat = q.astype(np.float32) / qmax * max_abs
-
-        # crude toy residual correction
-        correction = (residual_sign.astype(np.float32) * 2.0 -
-                      1.0) * (max_abs / (8 * qmax + 1e-8))
-        y_corr = y_hat + correction
-
-        x_hat = y_corr @ self.R.T
-        return x_hat
-
-    def estimate_bits_per_value(self) -> float:
-        # q uses self.bits bits, residual sign uses 1 bit, scale overhead amortized separately
-        return float(self.bits + 1)
+def update_tier(active: bool, reuse_score: float) -> Tier:
+    if active:
+        return Tier.HOT
+    if reuse_score > 0.7:
+        return Tier.WARM
+    return Tier.COLD
 
 
-# -----------------------------
-# KVTC-like toy codec
-# -----------------------------
-class KVTCToy:
-    """
-    Educational toy approximation:
-    1) calibrate PCA on a sample
-    2) decorrelate features
-    3) allocate bits based on component variance
-    4) scalar quantize each component
+def choose_codec(tier: Tier) -> str:
+    if tier == Tier.HOT:
+        return "low_overhead_codec"
+    if tier == Tier.WARM:
+        return "balanced_codec"
+    return "high_compression_codec"
 
-    This is NOT the real KVTC implementation.
-    It captures the codec-style intuition only.
-    """
 
-    def __init__(self, dim: int, total_bits_per_vector: int):
-        self.dim = dim
-        self.total_bits_per_vector = total_bits_per_vector
-        self.mean = None
-        self.components = None
-        self.component_bits = None
-        self.scales = None
+def estimated_compressed_size_mb(block: KVBlock) -> float:
+    ratio = {
+        "low_overhead_codec": 0.5,
+        "balanced_codec": 0.3,
+        "high_compression_codec": 0.15,
+    }[block.codec]
+    return block.size_mb * ratio
 
-    def fit(self, calibration_data: np.ndarray) -> None:
-        self.mean = calibration_data.mean(axis=0, keepdims=True)
-        x = calibration_data - self.mean
 
-        cov = np.cov(x, rowvar=False)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        order = np.argsort(eigvals)[::-1]
-        eigvals = eigvals[order]
-        eigvecs = eigvecs[:, order]
-
-        self.components = eigvecs
-
-        # bit allocation proportional to variance
-        weights = eigvals / (eigvals.sum() + 1e-8)
-        raw = weights * self.total_bits_per_vector
-        bits = np.floor(raw).astype(int)
-
-        while bits.sum() < self.total_bits_per_vector:
-            idx = int(np.argmax(raw - bits))
-            bits[idx] += 1
-
-        bits = np.maximum(bits, 1)
-        self.component_bits = bits
-
-        z = x @ self.components
-        self.scales = np.max(np.abs(z), axis=0, keepdims=True) + 1e-8
-
-    def compress(self, x: np.ndarray) -> dict:
-        z = (x - self.mean) @ self.components
-        codes = []
-        for i in range(self.dim):
-            b = int(self.component_bits[i])
-            qmax = 2 ** (b - 1) - 1
-            qmax = max(qmax, 1)
-            zi = np.round(
-                np.clip(z[:, i:i+1] / self.scales[:, i:i+1], -1.0, 1.0) * qmax).astype(np.int16)
-            codes.append(zi)
-        return {"codes": codes}
-
-    def decompress(self, packed: dict) -> np.ndarray:
-        zs = []
-        for i in range(self.dim):
-            b = int(self.component_bits[i])
-            qmax = 2 ** (b - 1) - 1
-            qmax = max(qmax, 1)
-            zi = packed["codes"][i].astype(
-                np.float32) / qmax * self.scales[:, i:i+1]
-            zs.append(zi)
-        z = np.concatenate(zs, axis=1)
-        x_hat = z @ self.components.T + self.mean
-        return x_hat
-
-    def estimate_avg_bits_per_value(self) -> float:
-        return float(self.total_bits_per_vector / self.dim)
+def build_demo_blocks(n: int = 10) -> list[KVBlock]:
+    random.seed(42)
+    blocks = []
+    for i in range(n):
+        active = random.random() < 0.3
+        reuse_score = random.random()
+        size_mb = round(random.uniform(32, 256), 1)
+        block = KVBlock(
+            block_id=f"block_{i}",
+            active=active,
+            reuse_score=reuse_score,
+            size_mb=size_mb,
+        )
+        block.tier = update_tier(block.active, block.reuse_score)
+        block.codec = choose_codec(block.tier)
+        blocks.append(block)
+    return blocks
 
 
 def main() -> None:
-    set_seed(0)
+    blocks = build_demo_blocks()
 
-    n = 1024
-    dim = 16
+    print("=== KV lifecycle-aware codec demo ===\n")
+    total_raw = 0.0
+    total_compressed = 0.0
 
-    # synthetic KV-like vectors with correlation
-    base = np.random.randn(n, dim // 2)
-    x = np.concatenate(
-        [base, base + 0.1 * np.random.randn(n, dim // 2)], axis=1).astype(np.float32)
+    for b in blocks:
+        compressed = estimated_compressed_size_mb(b)
+        total_raw += b.size_mb
+        total_compressed += compressed
 
-    # TurboQuant-like toy
-    tq = TurboQuantToy(dim=dim, bits=3)
-    tq_packed = tq.compress(x)
-    x_tq = tq.decompress(tq_packed)
+        print(
+            f"{b.block_id:8s} "
+            f"active={str(b.active):5s} "
+            f"reuse={b.reuse_score:.2f} "
+            f"tier={b.tier.value:4s} "
+            f"codec={b.codec:22s} "
+            f"raw={b.size_mb:6.1f}MB "
+            f"compressed={compressed:6.1f}MB"
+        )
 
-    # KVTC-like toy
-    calibration = x[:256]
-    kvtc = KVTCToy(dim=dim, total_bits_per_vector=48)  # avg 3 bits/value
-    kvtc.fit(calibration)
-    kvtc_packed = kvtc.compress(x)
-    x_kvtc = kvtc.decompress(kvtc_packed)
+    print("\nSummary:")
+    print(f"raw total        : {total_raw:.1f} MB")
+    print(f"compressed total : {total_compressed:.1f} MB")
+    print(f"effective ratio  : {total_compressed / total_raw:.3f}")
 
-    print("=== Toy KV compression comparison ===")
-    print(f"Input shape: {x.shape}")
-    print()
-    print("TurboQuant-like toy")
-    print(f"  approx bits/value : {tq.estimate_bits_per_value():.2f}")
-    print(f"  reconstruction MSE: {mse(x, x_tq):.6f}")
-    print()
-    print("KVTC-like toy")
-    print(f"  avg bits/value    : {kvtc.estimate_avg_bits_per_value():.2f}")
-    print(f"  reconstruction MSE: {mse(x, x_kvtc):.6f}")
-    print()
-    print("Interpretation:")
-    print("- TurboQuant-like path is lightweight and easy to apply.")
-    print("- KVTC-like path uses calibration + transform coding.")
-    print("- They are solving related but not identical serving problems.")
+    print("\nInterpretation:")
+    print("- Hot blocks get lower-overhead compression.")
+    print("- Warm blocks get balanced compression.")
+    print("- Cold blocks get stronger storage-oriented compression.")
+    print("- Real systems would use richer policies, but the lifecycle idea is the same.")
 
 
 if __name__ == "__main__":
