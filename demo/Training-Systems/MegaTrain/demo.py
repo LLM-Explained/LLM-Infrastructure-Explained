@@ -65,8 +65,10 @@ class MegaTrainBackbone:
         """
         Stream host-resident parameters to device.
         """
-        w = layer.weight.to(self.device, non_blocking=True).detach().requires_grad_(requires_grad)
-        b = layer.bias.to(self.device, non_blocking=True).detach().requires_grad_(requires_grad)
+        w = layer.weight.to(self.device, non_blocking=True).detach(
+        ).requires_grad_(requires_grad)
+        b = layer.bias.to(self.device, non_blocking=True).detach(
+        ).requires_grad_(requires_grad)
         return w, b
 
     def forward_streamed(self, x: torch.Tensor):
@@ -151,7 +153,8 @@ def inspect_host_memory(model: MegaTrainBackbone) -> None:
 
     print(f"host param bytes     : {total_param_bytes / 1024:.2f} KB")
     print(f"host optimizer bytes : {total_opt_bytes / 1024:.2f} KB")
-    print(f"persistent host total: {(total_param_bytes + total_opt_bytes) / 1024:.2f} KB")
+    print(
+        f"persistent host total: {(total_param_bytes + total_opt_bytes) / 1024:.2f} KB")
 
 
 def main():
@@ -167,7 +170,8 @@ def main():
     print()
 
     for step in range(5):
-        x, y = make_batch(batch_size=32, in_dim=64, num_classes=10, device=device)
+        x, y = make_batch(batch_size=32, in_dim=64,
+                          num_classes=10, device=device)
         loss = train_step(model, x, y, lr=5e-2)
         print(f"step={step:02d} loss={loss:.4f}")
 
